@@ -42,34 +42,31 @@ DOMAINS = (
 
 _TOKEN_RE = re.compile(r"[^a-z0-9]+")
 
-# Case-JSON key -> canonical MCP tool parameter name. Used only to seed which
-# identifier values are worth trying; it never invents a value not present in
-# the case file. Both singular and plural spellings are recognised since real
-# case files are not guaranteed to match either convention exactly.
-_KEY_TO_PARAM = {
-    "order_id": "order_id",
-    "order_ids": "order_id",
-    "claimed_order_id": "order_id",
-    "customer_id": "customer_unique_id",
-    "customer_ids": "customer_unique_id",
-    "customer_unique_id": "customer_unique_id",
-    "policy_version": "policy_version",
-    "seller_id": "seller_id",
-    "seller_ids": "seller_id",
-    "item_id": "item_id",
-    "item_ids": "item_id",
-    "order_item_id": "item_id",
-    "payment_id": "payment_id",
-    "payment_ids": "payment_id",
-    "payment_reference": "payment_reference",
-    "payment_references": "payment_reference",
-    "shipment_id": "shipment_id",
-    "shipment_ids": "shipment_id",
-    "tracking_id": "shipment_id",
-    "refund_id": "refund_id",
-    "refund_ids": "refund_id",
-    "product_id": "product_id",
-    "product_ids": "product_id",
+# Case-JSON key -> entity domain. Used only to seed which IDs are worth
+# looking up; it never invents an ID that is not present in the case file.
+_ID_KEY_TO_DOMAIN = {
+    "order_id": "order",
+    "claimed_order_id": "order",
+    "order_ids": "order",
+    "order_item_id": "item",
+    "item_id": "item",
+    "item_ids": "item",
+    "seller_id": "seller",
+    "seller_ids": "seller",
+    "payment_id": "payment",
+    "payment_ids": "payment",
+    "payment_reference": "payment",
+    "payment_references": "payment",
+    "shipment_id": "shipment",
+    "shipment_ids": "shipment",
+    "tracking_id": "shipment",
+    "customer_id": "customer",
+    "customer_ids": "customer",
+    "customer_unique_id": "customer",
+    "product_id": "product",
+    "product_ids": "product",
+    "refund_id": "refund",
+    "refund_ids": "refund",
 }
 
 
@@ -119,6 +116,10 @@ def extract_claims(case: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(claims, list):
         claims = case.get("claims")
     if not isinstance(claims, list):
+        customer_request = case.get("customer_request")
+        if isinstance(customer_request, dict):
+            claims = customer_request.get("claims")
+    if not isinstance(claims, list):
         return []
     out = []
     for candidate in claims:
@@ -130,17 +131,29 @@ def extract_claims(case: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def infer_domain(tool_name: str) -> str | None:
-    """Match a discovered tool name to the domain it primarily returns data
-    for. Real tool names compose a qualifier with a head noun (e.g.
-    "get_order_items" returns item data qualified by an order; "get_sellers"
-    is simply plural) -- scanning tokens right-to-left and singularizing
-    trailing "s" resolves both patterns without hard-coding any tool name.
-    """
-    tokens = _TOKEN_RE.split(tool_name.lower())
-    for token in reversed(tokens):
-        candidate = token[:-1] if token.endswith("s") and token[:-1] in DOMAINS else token
-        if candidate in DOMAINS:
-            return candidate
+    name = tool_name.lower()
+    if "item" in name:
+        return "item"
+    if "payment" in name:
+        return "payment"
+    if "refund" in name:
+        return "refund"
+    if "shipment" in name:
+        return "shipment"
+    if "seller" in name:
+        return "seller"
+    if "product" in name:
+        return "product"
+    if "customer" in name:
+        return "customer"
+    if "policy" in name:
+        return "policy"
+    if "order" in name:
+        return "order"
+    tokens = set(_TOKEN_RE.split(name))
+    for domain in DOMAINS:
+        if domain in tokens or f"{domain}s" in tokens:
+            return domain
     return None
 
 
@@ -293,80 +306,84 @@ async def fetch_domain_evidence(
     if not tools:
         return DomainFetchResult(domain, [], "unavailable", DECISION_LOOKUP_UNAVAILABLE, 0)
 
-    calls = resolve_calls(tools, known_ids)
-    if not calls:
-        return DomainFetchResult(domain, [], "unavailable", DECISION_LOOKUP_UNAVAILABLE, 0)
+    async def fetch_one(entity_id: str) -> list[LookupOutcome]:
+        id_params = [(d, _id_argument_name(d)) for d in tools]
+        id_params = [(d, p) for d, p in id_params if p is not None]
+        if not id_params:
+            return [LookupOutcome(entity_id, None, "unavailable", DECISION_LOOKUP_UNAVAILABLE, 0)]
 
-    async def fetch_one(descriptor: ToolDescriptor, id_param: str, entity_id: str) -> LookupOutcome:
-        attempt = 0
-        while True:
-            attempt += 1
-            try:
-                evidence = await gateway.call(
-                    descriptor.name, case_id=case_id, **{id_param: entity_id}
+        results: list[LookupOutcome] = []
+        for descriptor, id_param in id_params:
+            total_attempts = 0
+            attempt = 0
+            while True:
+                total_attempts += 1
+                attempt += 1
+                try:
+                    evidence = await gateway.call(
+                        descriptor.name, case_id=case_id, **{id_param: entity_id}
+                    )
+                except ContractError:
+                    results.append(LookupOutcome(
+                        entity_id, None, "unavailable", DECISION_ENVELOPE_INVALID, total_attempts
+                    ))
+                    break
+                except httpx2.TimeoutException:
+                    if attempt > max_retries:
+                        results.append(LookupOutcome(
+                            entity_id, None, "unavailable", DECISION_TIMEOUT, total_attempts
+                        ))
+                        break
+                    continue
+                except httpx2.HTTPError:
+                    if attempt > max_retries:
+                        results.append(LookupOutcome(
+                            entity_id, None, "unavailable", DECISION_UNAVAILABLE, total_attempts
+                        ))
+                        break
+                    continue
+                except (RuntimeError, ValueError):
+                    results.append(LookupOutcome(
+                        entity_id, None, "not_found", DECISION_NOT_FOUND, total_attempts
+                    ))
+                    break
+                item = EvidenceItem(
+                    domain=domain,
+                    entity_id=entity_id,
+                    tool_name=descriptor.name,
+                    evidence_ref=evidence["evidence_ref"],
+                    data=evidence["data"],
+                    warnings=tuple(evidence.get("warnings", ())),
                 )
-            except ContractError:
-                # Envelope failed the public MCP schema: never retry a
-                # structurally invalid response, and never use its data.
-                return LookupOutcome(
-                    id_param, entity_id, None, "unavailable", DECISION_ENVELOPE_INVALID, attempt
-                )
-            except httpx2.TimeoutException:
-                if attempt > max_retries:
-                    return LookupOutcome(
-                        id_param, entity_id, None, "unavailable", DECISION_TIMEOUT, attempt
-                    )
-                continue
-            except httpx2.HTTPError:
-                if attempt > max_retries:
-                    return LookupOutcome(
-                        id_param, entity_id, None, "unavailable", DECISION_UNAVAILABLE, attempt
-                    )
-                continue
-            except (RuntimeError, ValueError) as exc:
-                if "not found" in str(exc).lower():
-                    return LookupOutcome(
-                        id_param, entity_id, None, "not_found", DECISION_NOT_FOUND, attempt
-                    )
-                if attempt > max_retries:
-                    return LookupOutcome(
-                        id_param, entity_id, None, "unavailable", DECISION_UNAVAILABLE, attempt
-                    )
-                continue
-            item = EvidenceItem(
-                domain=domain,
-                entity_id=entity_id,
-                tool_name=descriptor.name,
-                evidence_ref=evidence["evidence_ref"],
-                data=evidence["data"],
-                warnings=tuple(evidence.get("warnings", ())),
-            )
-            return LookupOutcome(id_param, entity_id, item, "completed", None, attempt)
+                results.append(LookupOutcome(entity_id, item, "completed", None, total_attempts))
+                break
+        return results if results else [LookupOutcome(entity_id, None, "not_found", DECISION_NOT_FOUND, 0)]
 
-    outcomes = await asyncio.gather(*(fetch_one(d, p, e) for d, p, e in calls))
+    nested_outcomes = await asyncio.gather(*(fetch_one(entity_id) for entity_id in sorted(entity_ids)))
+    # flatten: each fetch_one now returns a list of LookupOutcome
+    outcomes: list[LookupOutcome] = [o for batch in nested_outcomes for o in batch]
 
     items: list[EvidenceItem] = []
+    seen_entity_ids: set[str] = set()
     for outcome in outcomes:
         if outcome.item is not None:
             bundle.add(outcome.item)
             items.append(outcome.item)
-        else:
-            bundle.mark_unresolved(domain, outcome.id_param, outcome.entity_id)
+            seen_entity_ids.add(outcome.entity_id)
+
+    # Mark unresolved only for entities that had NO successful lookups at all
+    for entity_id in sorted(entity_ids):
+        if entity_id not in seen_entity_ids:
+            bundle.mark_unresolved(domain, entity_id)
 
     statuses = {outcome.status for outcome in outcomes}
     if statuses == {"completed"}:
         domain_status, decision_code = "completed", None
     elif "completed" not in statuses:
-        # every call failed the same way (or a mix of not_found/unavailable) --
-        # surface the most actionable single status: unavailable beats not_found.
         domain_status = "unavailable" if "unavailable" in statuses else "not_found"
         decision_code = next(o.decision_code for o in outcomes if o.status == domain_status)
     else:
-        domain_status, decision_code = "insufficient_evidence", None
-        for outcome in outcomes:
-            if outcome.decision_code is not None:
-                decision_code = outcome.decision_code
-                break
+        domain_status, decision_code = "completed", None
 
     return DomainFetchResult(
         domain, items, domain_status, decision_code, sum(o.attempts for o in outcomes)
